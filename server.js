@@ -7,13 +7,15 @@ const {
     Connection,
     PublicKey,
     Keypair,
+    Transaction,
     clusterApiUrl,
 } = require('@solana/web3.js');
 const {
     getOrCreateAssociatedTokenAccount,
+    createMint,
     mintTo,
-    TOKEN_PROGRAM_ID,
     createBurnInstruction,
+    TOKEN_PROGRAM_ID,
 } = require('@solana/spl-token');
 const {
     Metaplex,
@@ -26,8 +28,8 @@ const app = express();
 // ============================
 // Middleware
 // ============================
-app.use(rateLimit({ windowMs: 15 * 60 * 1000, max: 120 }));
-app.use(cors({ origin: 'https://atomicfizzcaps.xyz' }));
+app.use(rateLimit({ windowMs: 15 * 60 * 1000, max: 200 }));
+app.use(cors()); // Allows localhost + your domain
 app.use(express.json({ limit: '10mb' }));
 
 // ============================
@@ -36,31 +38,31 @@ app.use(express.json({ limit: '10mb' }));
 const required = ['PRIVATE_KEY_BASE64', 'REDIS_URL'];
 required.forEach(k => { if (!process.env[k]) throw new Error(`Missing env var: ${k}`); });
 
-const connection = new Connection(process.env.SOLANA_RPC_URL || clusterApiUrl('mainnet-beta'), 'confirmed');
+const connection = new Connection(
+    process.env.SOLANA_RPC_URL || clusterApiUrl('mainnet-beta'),
+    'confirmed'
+);
+
 const secret = Uint8Array.from(atob(process.env.PRIVATE_KEY_BASE64), c => c.charCodeAt(0));
 const mintAuthority = Keypair.fromSecretKey(secret);
+
 const CAPS_MINT = new PublicKey(process.env.CAPS_MINT || 'FywSJiYrtgErQwGeySiugRxCNg9xAnzRqmZQr6v2mEt2');
 
 const metaplex = Metaplex.make(connection)
     .use(keypairIdentity(mintAuthority))
-    .use(bundlrStorage());
+    .use(bundlrStorage({ timeout: 60000 }));
 
+// ============================
 // Redis
+// ============================
 const redis = createClient({ url: process.env.REDIS_URL });
 redis.on('error', err => console.error('Redis error:', err));
 redis.connect();
 
 // ============================
-// HARD-CODED LOCATIONS (fixes Vercel forever)
+// HARD-CODED LOCATIONS (No external file needed)
 // ============================
-// ============================
-// FULL HARD-CODED LOCATIONS (copy-paste this exact block)
-// ============================
-// ============================
-// FULL HARD-CODED LOCATIONS (copy-paste this exact block)
-// ============================
-const locations = [
-    { n: "Goodsprings Saloon", lat: 35.8324, lng: -115.4320, lvl: 1, rarity: "common" },
+const locations = [{ n: "Goodsprings Saloon", lat: 35.8324, lng: -115.4320, lvl: 1, rarity: "common" },
     { n: "Primm Rollercoaster", lat: 35.6145, lng: -115.3845, lvl: 2, rarity: "common" },
     { n: "Novac Motel", lat: 35.0525, lng: -114.8247, lvl: 5, rarity: "rare" },
     { n: "Hoover Dam", lat: 36.016, lng: -114.738, lvl: 12, rarity: "epic" },
@@ -262,92 +264,117 @@ const locations = [
     { n: "Vault 92", lat: 38.900, lng: -77.300, lvl: 25, rads: 80 },
     { n: "Vault 106", lat: 38.800, lng: -77.400, lvl: 32, rads: 120 },
     { n: "Vault 112", lat: 38.700, lng: -77.500, lvl: 28, rads: 100 },
-    { n: "Mothership Zeta", lat: 0, lng: 0, lvl: 99, rarity: "legendary" }  the rest of your locations here];
+    { n: "Mothership Zeta", lat: 0, lng: 0, lvl: 99, rarity: "legendary" }
     ];
+
 // ============================
-// Routes
+// Helper: Player State
 // ============================
-app.get('/locations', (req, res) => res.json(locations));
-app.get('/api/locations', (req, res) => res.json(locations));
-
-// ===== INVENTORY & QUESTS (this is what was missing) =====
-app.get('/api/player/:wallet', async (req, res) => {
-    try {
-        const { wallet } = req.params;
-        const data = await redis.get(`player:${wallet}`);
-        if (!data) return res.json({ level: 1, xp: 0, caps: 0, inventory: [], stimpaks: [], quests: [] });
-        res.json(JSON.parse(data));
-    } catch (e) {
-        res.json({ level: 1, xp: 0, caps: 0, inventory: [], stimpaks: [], quests: [] });
+async function getOrCreatePlayer(wallet) {
+    const key = `player:${wallet}`;
+    let player = await redis.json.get(key);
+    if (!player) {
+        player = {
+            lvl: 1,
+            hp: 100,
+            maxHp: 100,
+            caps: 0,
+            gear: [],
+            stimpaks: [],
+            claimed: []
+        };
+        await redis.json.set(key, '$', player);
     }
-});
+    return player;
+}
 
-app.post('/api/player/:wallet', async (req, res) => {
+// ============================
+// Mint Gear NFT (Simple)
+// ============================
+async function mintGear(toPubkey, name, rarity) {
+    const metadata = {
+        name: `${rarity.toUpperCase()} ${name}`,
+        symbol: "AFGEAR",
+        description: `Found in the wasteland • ${rarity}`,
+        image: `https://i.ibb.co/4p7vK3B/nuka-crate.png`, // Replace with real art later
+        attributes: [{ trait_type: "Rarity", value: rarity }]
+    };
+
     try {
-        const { wallet } = req.params;
-        await redis.set(`player:${wallet}`, JSON.stringify(req.body));
-        res.json({ success: true });
+        const { nft } = await metaplex.nfts().create({
+            uri: await metaplex.nfts().uploadMetadata(metadata),
+            name: metadata.name,
+            sellerFeeBasisPoints: 500,
+            creators: [{ address: mintAuthority.publicKey, share: 100 }],
+        });
+
+        await metaplex.nfts().transfer({
+            nftOrSft: nft,
+            fromOwner: mintAuthority.publicKey,
+            toOwner: toPubkey,
+        });
+
+        return { name, rarity, mint: nft.address.toBase58() };
     } catch (e) {
-        res.status(500).json({ error: 'save failed' });
+        console.error("Mint failed:", e);
+        return null;
     }
+}
+
+// ============================
+// API ENDPOINTS
+// ============================
+app.get('/locations', (req, res) => {
+    res.json(locations);
 });
 
-app.get('/api/quests', (req, res) => {
-    res.json([
-        { id: 1, name: "Visit Goodsprings", reward: 100, target: "Goodsprings Saloon" },
-        { id: 2, name: "Reach Level 10", reward: 500, target: 10 }
-    ]);
-});
+app.get('/api/ping', (req, res) => res.json({ status: "VAULT-TEC ONLINE" }));
 
 app.post('/claim-survival', async (req, res) => {
     try {
         const { wallet, spot } = req.body;
-        if (!wallet || !spot) return res.status(400).json({ error: 'Missing wallet or spot' });
+        if (!wallet || !spot) return res.status(400).json({ error: "Missing params" });
+
+        const loc = locations.find(l => l.n === spot);
+        if (!loc) return res.status(400).json({ error: "Location not found" });
 
         const walletPubkey = new PublicKey(wallet);
-        const cooldownKey = `cooldown:claim:${wallet}:${spot}`;
-        if (await redis.exists(cooldownKey))
-            return res.status(429).json({ error: 'Still irradiated — wait 24h!' });
+        const cooldownKey = `cooldown:${wallet}:${spot}`;
+        if (await redis.get(cooldownKey)) return res.status(429).json({ error: "Already claimed (24h cooldown)" });
 
-        // === Mint 25 CAPS ===
+        const player = await getOrCreatePlayer(wallet);
+        if (player.lvl < loc.lvl) return res.status(400).json({ error: `Level ${loc.lvl} required` });
+
+        // Mint 25 CAPS
         const ata = await getOrCreateAssociatedTokenAccount(connection, mintAuthority, CAPS_MINT, walletPubkey);
-        const mintSig = await mintTo(connection, mintAuthority, CAPS_MINT, ata.address, mintAuthority, 25_000_000_000); // 25 CAPS (9 decimals)
+        const mintSig = await mintTo(connection, mintAuthority, CAPS_MINT, ata.address, mintAuthority, 25_000_000_000);
 
-        // === Random Gear Drop ===
+        // Gear drop chance
         let gearDrop = null;
         const roll = Math.random();
         if (roll < 0.03) gearDrop = await mintGear(walletPubkey, 'Power Armor T-51b', 'legendary');
         else if (roll < 0.12) gearDrop = await mintGear(walletPubkey, 'Service Rifle', 'rare');
         else if (roll < 0.30) gearDrop = await mintGear(walletPubkey, '10mm Pistol', 'common');
 
-        // === Possible Raid ===
-        let raid = null;
-        const highRisk = ['Black Mountain', 'Hoover Dam', 'Lucky 38', 'Area 51 Gate'];
-        if (highRisk.some((s) => spot.includes(s)) && Math.random() < 0.07) {
-            raid = await triggerRaid(wallet);
-        }
+        // Update player
+        player.caps += 25;
+        if (gearDrop) player.gear.push(gearDrop);
+        player.claimed.push(spot);
+        const oldLvl = player.lvl;
+        player.lvl = Math.floor(player.caps / 1000) + 1;
+        if (player.lvl > oldLvl) { player.maxHp += 50; player.hp = player.maxHp; }
 
-        // === Update Player State ===
-        const player = await getOrCreatePlayer(wallet);
-        const p = player[0] || player;
-        if (gearDrop) p.gear.push(gearDrop);
-        if (raid) {
-            p.hp = raid.hp;
-            p.gear = raid.gear;
-        }
-        await redis.json.set(`player:${wallet}`, '$', p);
-
-        // === 24h cooldown per spot ===
+        await redis.json.set(`player:${wallet}`, '$', player);
         await redis.set(cooldownKey, '1', { EX: 86400 });
 
         res.json({
             success: true,
             caps: 25,
             gear: gearDrop,
-            raid,
-            hp: p.hp,
-            explorer: `https://solscan.io/tx/${mintSig}${process.env.SOLANA_RPC_URL?.includes('mainnet') ? '' : '?cluster=devnet'}`,
-            message: `${spot} LOOTED! +25 CAPS${gearDrop ? ' + GEAR!' : ''}${raid ? ' → RAILED!' : ''}`,
+            hp: player.hp,
+            lvl: player.lvl,
+            explorer: `https://solscan.io/tx/${mintSig}?cluster=${process.env.SOLANA_RPC_URL?.includes('devnet') ? 'devnet' : 'mainnet-beta'}`,
+            message: `${spot} LOOTED! +25 CAPS${gearDrop ? ' + GEAR!' : ''}`
         });
     } catch (err) {
         console.error('Claim error:', err);
@@ -355,86 +382,6 @@ app.post('/claim-survival', async (req, res) => {
     }
 });
 
-app.post('/buy-stimpak', async (req, res) => {
-    try {
-        const { wallet, tier } = req.body;
-        if (!wallet || !['common', 'rare', 'legendary'].includes(tier))
-            return res.status(400).json({ error: 'Invalid request' });
-
-        const costs = { common: 50, rare: 150, legendary: 500 };
-        const cost = costs[tier];
-
-        const walletPubkey = new PublicKey(wallet);
-        const ata = await getOrCreateAssociatedTokenAccount(connection, mintAuthority, CAPS_MINT, walletPubkey);
-        const balance = await connection.getTokenAccountBalance(ata.address);
-        const currentCaps = Number(balance.value.amount) / 1_000_000_000; // Assuming 9 decimals
-        if (currentCaps < cost) return res.status(400).json({ error: 'Not enough CAPS' });
-
-        const recentBlockhash = await connection.getLatestBlockhash();
-        const tx = new Transaction({
-            recentBlockhash: recentBlockhash.blockhash,
-            feePayer: walletPubkey,
-        });
-
-        const burnAmount = BigInt(cost * 1_000_000_000);
-        const burnInstruction = createBurnInstruction(
-            ata.address,
-            CAPS_MINT,
-            walletPubkey,
-            burnAmount
-        );
-        tx.add(burnInstruction);
-
-        const serializedTx = tx.serialize({ requireAllSignatures: false, verifySignatures: false }).toString('base64');
-
-        // Store pending buy in Redis with a short TTL
-        await redis.set(`pending-buy:${wallet}:${tier}`, serializedTx, { EX: 300 }); // 5 min
-
-        res.json({ transaction: serializedTx, message: 'Sign and send this transaction with your wallet.' });
-    } catch (err) {
-        console.error('Buy stimpak error:', err);
-        res.status(500).json({ error: 'Server error' });
-    }
-});
-
-app.post('/confirm-buy-stimpak', async (req, res) => {
-    try {
-        const { wallet, tier, signature } = req.body;
-        if (!wallet || !tier || !signature) return res.status(400).json({ error: 'Missing params' });
-
-        // Verify pending
-        const pendingKey = `pending-buy:${wallet}:${tier}`;
-        const pendingTx = await redis.get(pendingKey);
-        if (!pendingTx) return res.status(400).json({ error: 'No pending buy found' });
-
-        // Confirm transaction
-        const sigStatus = await connection.confirmTransaction(signature, 'confirmed');
-        if (sigStatus.value.err) return res.status(400).json({ error: 'Transaction failed' });
-
-        // Optional: Fetch tx details to verify burn amount, but for simplicity skip if rate-limited
-
-        // Mint stimpak NFT
-        const walletPubkey = new PublicKey(wallet);
-        const stimpak = await mintStimpak(walletPubkey, tier); // Assume you have this function similar to mintGear
-
-        // Update player if needed (e.g., add to inventory)
-        const playerData = await getOrCreatePlayer(wallet);
-        const player = playerData[0] || playerData;
-        if (!player.stimpaks) player.stimpaks = [];
-        player.stimpaks.push(stimpak);
-        await redis.json.set(`player:${wallet}`, '$', player);
-
-        // Clean pending
-        await redis.del(pendingKey);
-
-        res.json({
-            success: true,
-            stimpak,
-            explorer: `https://solscan.io/tx/${signature}${process.env.SOLANA_RPC_URL?.includes('mainnet') ? '' : '?cluster=devnet'}`,
-            message: `Stimpak (${tier}) purchased!`
-        });
-    } catch (err) {
-        console.error('Confirm buy error:', err);
-        res.status(500).json({ error: 'Server error' });
-    }
+app.listen(process.env.PORT || 3000, () => {
+    console.log('ATOMIC FIZZ CAPS SERVER LIVE • PORT', process.env.PORT || 3000);
 });
